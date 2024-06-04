@@ -162,13 +162,10 @@ export default async function pMap(
 	});
 }
 
-export function pMapIterable(
+export async function * pMapIterable(
 	iterable,
 	mapper,
-	{
-		concurrency = Number.POSITIVE_INFINITY,
-		backpressure = concurrency,
-	} = {},
+	{concurrency = Number.POSITIVE_INFINITY, backpressure = concurrency} = {},
 ) {
 	if (iterable[Symbol.iterator] === undefined && iterable[Symbol.asyncIterator] === undefined) {
 		throw new TypeError(`Expected \`input\` to be either an \`Iterable\` or \`AsyncIterable\`, got (${typeof iterable})`);
@@ -186,84 +183,32 @@ export function pMapIterable(
 		throw new TypeError(`Expected \`backpressure\` to be an integer from \`concurrency\` (${concurrency}) and up or \`Infinity\`, got \`${backpressure}\` (${typeof backpressure})`);
 	}
 
-	return {
-		async * [Symbol.asyncIterator]() {
-			const iterator = iterable[Symbol.asyncIterator] === undefined ? iterable[Symbol.iterator]() : iterable[Symbol.asyncIterator]();
-
-			const promises = [];
-			let runningMappersCount = 0;
-			let isDone = false;
-			let index = 0;
-
-			function trySpawn() {
-				if (isDone || !(runningMappersCount < concurrency && promises.length < backpressure)) {
-					return;
-				}
-
-				const promise = (async () => {
-					const {done, value} = await iterator.next();
-
-					if (done) {
-						return {done: true};
-					}
-
-					runningMappersCount++;
-
-					// Spawn if still below concurrency and backpressure limit
-					trySpawn();
-
-					try {
-						const returnValue = await mapper(await value, index++);
-
-						runningMappersCount--;
-
-						if (returnValue === pMapSkip) {
-							const index = promises.indexOf(promise);
-
-							if (index > 0) {
-								promises.splice(index, 1);
-							}
-						}
-
-						// Spawn if still below backpressure limit and just dropped below concurrency limit
-						trySpawn();
-
-						return {done: false, value: returnValue};
-					} catch (error) {
-						isDone = true;
-						return {error};
-					}
-				})();
-
-				promises.push(promise);
-			}
-
-			trySpawn();
-
-			while (promises.length > 0) {
-				const {error, done, value} = await promises[0]; // eslint-disable-line no-await-in-loop
-
-				promises.shift();
-
-				if (error) {
-					throw error;
-				}
-
-				if (done) {
-					return;
-				}
-
-				// Spawn if just dropped below backpressure limit and below the concurrency limit
-				trySpawn();
-
-				if (value === pMapSkip) {
-					continue;
-				}
-
-				yield value;
-			}
-		},
+	const next = () => {
+		const item = iterable.shift();
+		const value = new Promise(r => r(item)).then(value => mapper(value));
+		const promise = value.then(value => ({
+			value,
+			done: iterable.length === 0,
+			promise,
+		}));
+		return promise;
 	};
+
+	const promises = new Set();
+	for (let i = 0; i < concurrency; i++) {
+		promises.add(next());
+	}
+
+	while (promises.size > 0) {
+		// eslint-disable-next-line no-await-in-loop
+		const {value, done, promise} = await Promise.race(promises);
+		promises.delete(promise);
+		yield value;
+
+		if (!done) {
+			promises.add(next());
+		}
+	}
 }
 
 export const pMapSkip = Symbol('skip');
